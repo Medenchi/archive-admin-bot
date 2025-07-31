@@ -2,4 +2,4 @@ feedparser
 python-telegram-bot[ext]
 yt-dlp
 requests
-httpx # <-- Добавили новую библиотеку
+apscheduler
