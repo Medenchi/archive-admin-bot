@@ -11,33 +11,25 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ (без изменений) ---
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UCAvrIl6ltV8MdJo3mV4Nl4Q"
 TEMP_FOLDER = 'temp_videos'
 DB_FILE = 'videos.json'
 MAX_VIDEOS_ENTRIES = 25 
-CHUNK_DURATION_SECONDS = 240 # 4 минуты
-
-# --- Загрузка секретов из Render ---
+CHUNK_DURATION_SECONDS = 240
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('TELEGRAM_ADMIN_ID'))
 GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
 GITHUB_REPO = os.environ.get('GITHUB_REPO')
 GITHUB_PAT = os.environ.get('GITHUB_PAT')
 GIT_REPO_URL = f"https://{GITHUB_USERNAME}:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
-
-# --- Настройка логирования ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# --- Глобальные переменные для отслеживания состояния ---
 is_processing = False
 current_status_message = ""
 
-# =================================================================================
-# --- БЛОК ЛОГИКИ GIT ---
-# =================================================================================
-
+# --- ВСЕ ФУНКЦИИ (setup_git_repo, get_video_db, process_single_video и т.д.) остаются БЕЗ ИЗМЕНЕНИЙ ---
+# ... (здесь идет весь код, который был выше, я его не дублирую для краткости) ...
 def setup_git_repo():
     if os.path.exists(GITHUB_REPO):
         logger.info("Обновляю существующий репозиторий...")
@@ -60,7 +52,6 @@ def save_and_push_db(db):
         logger.info("Сохраняю изменения на GitHub...")
         subprocess.run(f'cd {GITHUB_REPO} && git config user.name "Video Assistant Bot" && git config user.email "bot@render.com"', shell=True, check=True)
         subprocess.run(f'cd {GITHUB_REPO} && git add {DB_FILE}', shell=True, check=True)
-        # Проверяем, есть ли изменения перед коммитом
         result = subprocess.run(f'cd {GITHUB_REPO} && git diff --staged --quiet', shell=True)
         if result.returncode != 0:
             subprocess.run(f'cd {GITHUB_REPO} && git commit -m "Автоматическое обновление базы видео"', shell=True, check=True)
@@ -71,10 +62,6 @@ def save_and_push_db(db):
     except Exception as e:
         logger.error(f"Не удалось отправить изменения на GitHub: {e}")
 
-# =================================================================================
-# --- ОСНОВНОЙ БЛОК ОБРАБОТКИ ВИДЕО ---
-# =================================================================================
-
 async def update_status(context: ContextTypes.DEFAULT_TYPE, text: str):
     global current_status_message
     try:
@@ -82,7 +69,7 @@ async def update_status(context: ContextTypes.DEFAULT_TYPE, text: str):
         await context.bot.edit_message_text(text=new_text, chat_id=ADMIN_ID, message_id=context.user_data['status_message_id'])
         current_status_message = new_text
     except Exception:
-        pass # Игнорируем ошибки, если не удалось отредактировать
+        pass
 
 async def process_single_video(video_id: str, title: str, context: ContextTypes.DEFAULT_TYPE):
     global is_processing
@@ -127,7 +114,6 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
         if video_parts_info:
             new_entry = {'id': video_id, 'title': title, 'parts': video_parts_info}
             db = get_video_db()
-            # Проверяем, нет ли уже такого видео, чтобы не было дублей
             db = [v for v in db if v['id'] != video_id]
             db.insert(0, new_entry)
             while len(db) > MAX_VIDEOS_ENTRIES: db.pop()
@@ -141,43 +127,25 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
     finally:
         is_processing = False
 
-# =================================================================================
-# --- БЛОК АВТОМАТИЧЕСКОЙ ПРОВЕРКИ ---
-# =================================================================================
-
 async def scheduled_job_async(app):
     global is_processing
     if is_processing:
-        logger.info("Проверка по расписанию пропущена: бот уже занят.")
-        return
-        
-    logger.info("--- Запуск проверки по расписанию ---")
-    setup_git_repo()
-    db = get_video_db()
-    existing_ids = {video['id'] for video in db}
-    
+        logger.info("Проверка по расписанию пропущена: бот уже занят."); return
+    logger.info("--- Запуск проверки по расписанию ---"); setup_git_repo()
+    db = get_video_db(); existing_ids = {video['id'] for video in db}
     feed = feedparser.parse(YOUTUBE_CHANNEL_URL)
     new_videos = [{'id': e.yt_videoid, 'title': e.title} for e in feed.entries if e.yt_videoid not in existing_ids]
-    
     if not new_videos:
         logger.info("Новых видео не найдено."); return
-    
     logger.info(f"Найдено {len(new_videos)} новых видео. Обрабатываю самое старое.")
     video_to_process = reversed(new_videos).__next__()
-    
-    # Создаем фейковый контекст для отправки статуса
     context = ContextTypes.DEFAULT_TYPE(application=app, chat_id=ADMIN_ID, user_id=ADMIN_ID)
     message = await context.bot.send_message(chat_id=ADMIN_ID, text="Начинаю автоматическую обработку...")
     context.user_data['status_message_id'] = message.message_id
-    
     await process_single_video(video_to_process['id'], video_to_process['title'], context)
 
 def run_scheduled_job(app):
     asyncio.run(scheduled_job_async(app))
-
-# =================================================================================
-# --- БЛОК TELEGRAM-БОТА ---
-# =================================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
@@ -195,63 +163,73 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if is_processing:
         await query.edit_message_text(text="Я сейчас занят, попробуй позже."); return
-
     if query.data == 'list_new_videos':
         await query.edit_message_text(text="Проверяю YouTube, подожди...")
-        setup_git_repo()
-        db = get_video_db()
-        existing_ids = {video['id'] for video in db}
-        
+        setup_git_repo(); db = get_video_db(); existing_ids = {video['id'] for video in db}
         feed = feedparser.parse(YOUTUBE_CHANNEL_URL)
         new_videos = [{'id': e.yt_videoid, 'title': e.title} for e in feed.entries if e.yt_videoid not in existing_ids]
-
         if not new_videos:
             await query.edit_message_text(text="Все последние видео уже загружены! ✅"); return
-        
         keyboard = [[InlineKeyboardButton(video['title'][:50] + "...", callback_data=f"process_{video['id']}")] for video in new_videos[:5]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(text="Вот последние незагруженные видео:", reply_markup=reply_markup)
-
     elif query.data.startswith('process_'):
         video_id = query.data.split('_')[1]
         feed = feedparser.parse(YOUTUBE_CHANNEL_URL)
         video_info = next((v for v in feed.entries if v.yt_videoid == video_id), None)
-        
         if video_info:
             global current_status_message
             current_status_message = "Начинаю ручную обработку..."
             message = await query.edit_message_text(text=current_status_message)
             context.user_data['status_message_id'] = message.message_id
-            
             thread = Thread(target=asyncio.run, args=(process_single_video(video_id, video_info.title, context),))
             thread.start()
         else:
             await query.edit_message_text("Не удалось найти информацию об этом видео.")
 
-# --- ЗАПУСК ВСЕЙ СИСТЕМЫ ---
-if __name__ == '__main__':
+# --- НОВЫЙ, ИСПРАВЛЕННЫЙ ЗАПУСК ---
+async def main():
+    # Создаем необходимые папки и репозиторий
     if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
     
+    # --- Настройка и запуск Telegram-бота ---
     application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(CallbackQueryHandler(button_callback))
     
+    # --- Настройка и запуск планировщика ---
     scheduler = BackgroundScheduler(timezone="Europe/Moscow")
     scheduler.add_job(run_scheduled_job, 'cron', args=[application], day_of_week='mon,tue,thu', hour=15, minute='0,30')
     scheduler.add_job(run_scheduled_job, 'cron', args=[application], day_of_week='wed,sat', hour='11-12', minute='0,30')
     scheduler.start()
     
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CallbackQueryHandler(button_callback))
+    logger.info("Планировщик и бот настроены. Запускаю polling...")
     
-    thread_bot = Thread(target=application.run_polling)
-    thread_bot.start()
+    # Запускаем бота в асинхронном режиме
+    await application.initialize()
+    await application.start()
+    await application.run_polling()
 
+# --- Запуск Flask-сервера в отдельном потоке (для Render) ---
+def run_flask():
     app = Flask(__name__)
     @app.route('/')
     def hello_world():
         return 'Бот-ассистент работает!'
+    # Render сам найдет нужный порт, поэтому 10000 может быть лучше
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+
+if __name__ == '__main__':
+    # Сначала клонируем/обновляем репозиторий
+    setup_git_repo()
     
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    # Запускаем Flask в фоновом потоке
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Основной поток запускает асинхронного бота
+    asyncio.run(main())
