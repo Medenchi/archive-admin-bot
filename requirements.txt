@@ -1,5 +1,6 @@
-python-telegram-bot
-apscheduler
-requests
 flask
-httpx
+feedparser
+python-telegram-bot[ext]
+apscheduler
+yt-dlp
+requests
