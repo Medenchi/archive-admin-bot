@@ -1,6 +1,5 @@
-flask
 feedparser
 python-telegram-bot[ext]
-apscheduler
 yt-dlp
 requests
+httpx # <-- Добавили новую библиотеку
