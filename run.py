@@ -2,13 +2,14 @@ import os
 import json
 import subprocess
 import feedparser
-import time
+import time as time_module # Переименовываем, чтобы не было конфликта
 import logging
 from threading import Thread
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import time # Вот это исправление!
 
 # --- НАСТРОЙКИ ---
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UCAvrIl6ltV8MdJo3mV4Nl4Q"
@@ -162,12 +163,11 @@ def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # --- ИНТЕГРИРОВАННЫЙ ПЛАНИРОВЩИК ---
     job_queue = application.job_queue
     # ПН, ВТ, ЧТ в 15:00 и 15:30 по МСК (12:00, 12:30 UTC)
     job_queue.run_daily(scheduled_job, time=time(12, 0), days=(0, 1, 3))
     job_queue.run_daily(scheduled_job, time=time(12, 30), days=(0, 1, 3))
-    # СР, СБ в 11:00, 11:30, 12:00, 12:30 по МСК (8:00...9:30 UTC)
+    # СР, СБ в 11:00, 11:30, 12:00 по МСК
     job_queue.run_daily(scheduled_job, time=time(8, 0), days=(2, 5))
     job_queue.run_daily(scheduled_job, time=time(8, 30), days=(2, 5))
     job_queue.run_daily(scheduled_job, time=time(9, 0), days=(2, 5))
