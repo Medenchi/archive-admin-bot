@@ -6,9 +6,9 @@ import time
 import logging
 from threading import Thread
 import asyncio
-import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # --- НАСТРОЙКИ ---
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UCAvrIl6ltV8MdJo3mV4Nl4Q"
@@ -22,13 +22,12 @@ GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
 GITHUB_REPO = os.environ.get('GITHUB_REPO')
 GITHUB_PAT = os.environ.get('GITHUB_PAT')
 GIT_REPO_URL = f"https://{GITHUB_USERNAME}:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
-RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL') # Render предоставляет эту переменную автоматически
-CRON_SECRET_KEY = os.environ.get('CRON_SECRET_KEY')
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 is_processing = False
 current_status_message = ""
+
 # ... (ВСЕ функции до блока Telegram-бота остаются без изменений) ...
 def setup_git_repo():
     if os.path.exists(GITHUB_REPO):
@@ -101,11 +100,10 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
     finally:
         is_processing = False
 
-async def check_for_new_videos_async(context: ContextTypes.DEFAULT_TYPE):
+async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     global is_processing
     if is_processing:
-        await context.bot.send_message(chat_id=ADMIN_ID, text="Проверка по расписанию пропущена: бот уже занят.")
-        return
+        logger.info("Проверка по расписанию пропущена: бот уже занят."); return
     logger.info("--- Запуск проверки по расписанию ---"); setup_git_repo()
     db = get_video_db(); existing_ids = {video['id'] for video in db}
     feed = feedparser.parse(YOUTUBE_CHANNEL_URL)
@@ -157,42 +155,29 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Не удалось найти информацию об этом видео.")
 
-async def web_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Скрытый обработчик для cron-запросов."""
-    if update.effective_user.id != ADMIN_ID: return # Безопасность
-    await check_for_new_videos_async(context)
-
-async def self_ping():
-    """Функция, которая "пинает" сама себя, чтобы сервис не засыпал."""
-    if not RENDER_EXTERNAL_URL:
-        logger.warning("RENDER_EXTERNAL_URL не установлена, самопинг отключен.")
-        return
-    
-    async with httpx.AsyncClient() as client:
-        while True:
-            await asyncio.sleep(60 * 14) # Пингуем каждые 14 минут
-            try:
-                await client.get(RENDER_EXTERNAL_URL)
-                logger.info("Самопинг успешен.")
-            except Exception as e:
-                logger.error(f"Ошибка самопинга: {e}")
-
-async def main():
+# --- ЗАПУСК ---
+def main():
     if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
     setup_git_repo()
     
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    # --- ИНТЕГРИРОВАННЫЙ ПЛАНИРОВЩИК ---
+    job_queue = application.job_queue
+    # ПН, ВТ, ЧТ в 15:00 и 15:30 по МСК (12:00, 12:30 UTC)
+    job_queue.run_daily(scheduled_job, time=time(12, 0), days=(0, 1, 3))
+    job_queue.run_daily(scheduled_job, time=time(12, 30), days=(0, 1, 3))
+    # СР, СБ в 11:00, 11:30, 12:00, 12:30 по МСК (8:00...9:30 UTC)
+    job_queue.run_daily(scheduled_job, time=time(8, 0), days=(2, 5))
+    job_queue.run_daily(scheduled_job, time=time(8, 30), days=(2, 5))
+    job_queue.run_daily(scheduled_job, time=time(9, 0), days=(2, 5))
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
-    # Добавляем секретную команду для cron
-    application.add_handler(CommandHandler(CRON_SECRET_KEY, web_handler))
     application.add_handler(CallbackQueryHandler(button_callback))
-
-    # Запускаем самопинг в фоне
-    asyncio.create_task(self_ping())
     
     logger.info("Бот готов и запускается...")
-    await application.run_polling()
+    application.run_polling()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
