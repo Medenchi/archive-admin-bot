@@ -2,7 +2,7 @@ import os
 import json
 import subprocess
 import feedparser
-import time
+import time as time_module
 import logging
 from threading import Thread
 import asyncio
@@ -17,22 +17,22 @@ TEMP_FOLDER = 'temp_videos'
 DB_FILE = 'videos.json'
 MAX_VIDEOS_ENTRIES = 25 
 CHUNK_DURATION_SECONDS = 240
-COOKIE_FILE = 'cookies.txt' # <-- Название для временного файла с куки
+COOKIE_FILE = 'cookies.txt'
 
-# --- Загрузка секретов ---
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('TELEGRAM_ADMIN_ID'))
 GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
 GITHUB_REPO = os.environ.get('GITHUB_REPO')
 GITHUB_PAT = os.environ.get('GITHUB_PAT')
-YOUTUBE_COOKIES_DATA = os.environ.get('YOUTUBE_COOKIES') # <-- Новый секрет!
+YOUTUBE_COOKIES_DATA = os.environ.get('YOUTUBE_COOKIES')
 GIT_REPO_URL = f"https://{GITHUB_USERNAME}:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
 
-# ... (остальной код до process_single_video) ...
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 is_processing = False
 current_status_message = ""
+
+# ... (ВСЕ функции до блока Telegram-бота остаются без изменений) ...
 def setup_git_repo():
     if os.path.exists(GITHUB_REPO):
         subprocess.run(f"cd {GITHUB_REPO} && git pull", shell=True, check=True)
@@ -62,33 +62,20 @@ async def update_status(context: ContextTypes.DEFAULT_TYPE, text: str):
         await context.bot.edit_message_text(text=new_text, chat_id=ADMIN_ID, message_id=context.user_data['status_message_id'])
         current_status_message = new_text
     except Exception: pass
-
 async def process_single_video(video_id: str, title: str, context: ContextTypes.DEFAULT_TYPE):
     global is_processing
     is_processing = True
     if context: await update_status(context, f"🎬 Начинаю обработку: {title[:50]}...")
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     video_parts_info = []
-
     try:
-        if context: await update_status(context, "📥 Скачиваю видео (480p) с аутентификацией...")
+        if context: await update_status(context, "📥 Скачиваю видео (480p)...")
         temp_filepath_template = os.path.join(TEMP_FOLDER, f'{video_id}_full.%(ext)s')
-        
-        # --- ИЗМЕНЕНИЕ: Добавляем cookies в команду ---
-        command_dl = [
-            'yt-dlp',
-            '--cookies', COOKIE_FILE, # <-- Используем файл с куки
-            '-f', 'best[height<=480]', 
-            '--output', temp_filepath_template, 
-            video_url
-        ]
+        command_dl = ['yt-dlp', '--cookies', COOKIE_FILE, '-f', 'best[height<=480]', '--output', temp_filepath_template, video_url]
         subprocess.run(command_dl, check=True, timeout=900)
-        
         full_filename = next((f for f in os.listdir(TEMP_FOLDER) if f.startswith(f"{video_id}_full")), None)
         if not full_filename: raise Exception("Файл не скачался")
         full_filepath = os.path.join(TEMP_FOLDER, full_filename)
-        
-        # ... (остальная часть функции без изменений: нарезка, загрузка)
         if context: await update_status(context, "🔪 Начинаю нарезку...")
         chunk_filename_template = os.path.join(TEMP_FOLDER, f"{video_id}_part_%03d.mp4")
         command_ffmpeg = ['ffmpeg', '-i', full_filepath, '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-map', '0', '-segment_time', str(CHUNK_DURATION_SECONDS), '-f', 'segment', '-reset_timestamps', '1', '-movflags', '+faststart', chunk_filename_template]
@@ -103,7 +90,7 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
             with open(chunk_filepath, 'rb') as video_file:
                 message = await context.bot.send_video(chat_id=CHANNEL_ID, video=video_file, caption=part_title, read_timeout=300, write_timeout=300, connect_timeout=300)
             video_parts_info.append({'part_num': i + 1, 'file_id': message.video.file_id})
-            os.remove(chunk_filepath)
+            os.remove(chunk_filename)
         if context: await update_status(context, "💾 Обновляю базу данных...")
         if video_parts_info:
             new_entry = {'id': video_id, 'title': title, 'parts': video_parts_info}
@@ -116,12 +103,10 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
         if context: await update_status(context, f"❌ Ошибка: {e}")
     finally:
         is_processing = False
-
-# ... (остальной код до main() без изменений)
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     global is_processing
     if is_processing:
-        logger.info("Проверка по расписанию пропущена: бот уже занят."); return
+        logger.info("Проверка по расписанию пропущена."); return
     logger.info("--- Запуск проверки по расписанию ---"); setup_git_repo()
     db = get_video_db(); existing_ids = {video['id'] for video in db}
     feed = feedparser.parse(YOUTUBE_CHANNEL_URL)
@@ -177,13 +162,11 @@ def main():
     if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
     setup_git_repo()
     
-    # --- ИЗМЕНЕНИЕ: Создаем временный файл cookies.txt ---
     if YOUTUBE_COOKIES_DATA:
-        with open(COOKIE_FILE, 'w') as f:
-            f.write(YOUTUBE_COOKIES_DATA)
+        with open(COOKIE_FILE, 'w') as f: f.write(YOUTUBE_COOKIES_DATA)
         logger.info("Временный файл cookies.txt создан.")
     else:
-        logger.warning("Секрет YOUTUBE_COOKIES не найден. Скачивание может не удаться.")
+        logger.warning("Секрет YOUTUBE_COOKIES не найден.")
     
     try:
         application = Application.builder().token(BOT_TOKEN).build()
@@ -200,9 +183,17 @@ def main():
         application.add_handler(CallbackQueryHandler(button_callback))
         
         logger.info("Бот готов и запускается...")
-        application.run_polling()
+        
+        # --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ---
+        # Правильный способ запустить polling в асинхронном окружении
+        async def run_bot():
+            await application.initialize()
+            await application.start()
+            await application.run_polling()
+        
+        asyncio.run(run_bot())
+
     finally:
-        # --- ИЗМЕНЕНИЕ: Удаляем временный файл cookies.txt ---
         if os.path.exists(COOKIE_FILE):
             os.remove(COOKIE_FILE)
             logger.info("Временный файл cookies.txt удален.")
