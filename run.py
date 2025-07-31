@@ -22,7 +22,6 @@ GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
 GITHUB_REPO = os.environ.get('GITHUB_REPO')
 GITHUB_PAT = os.environ.get('GITHUB_PAT')
 GIT_REPO_URL = f"https://{GITHUB_USERNAME}:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
-# Секретный ключ для запуска проверки. Придумай что-то свое и добавь в Secrets
 CRON_SECRET_KEY = os.environ.get('CRON_SECRET_KEY', 'default_secret_key') 
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -30,29 +29,45 @@ logger = logging.getLogger(__name__)
 is_processing = False
 current_status_message = ""
 
-# ... (ВСЕ ФУНКЦИИ до блока Telegram-бота остаются без изменений) ...
+# =================================================================================
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# =================================================================================
+
 def setup_git_repo():
     if os.path.exists(GITHUB_REPO):
+        logger.info("Обновляю репозиторий со склада...")
         subprocess.run(f"cd {GITHUB_REPO} && git pull", shell=True, check=True)
     else:
+        logger.info("Клонирую репозиторий со склада...")
         subprocess.run(f"git clone {GIT_REPO_URL}", shell=True, check=True)
+
 def get_video_db():
     db_path = os.path.join(GITHUB_REPO, DB_FILE)
     if os.path.exists(db_path):
-        with open(db_path, 'r') as f: return json.load(f)
+        try:
+            with open(db_path, 'r') as f: return json.load(f)
+        except json.JSONDecodeError:
+            return [] # Возвращаем пустой список, если JSON битый
     return []
+
 def save_and_push_db(db):
     db_path = os.path.join(GITHUB_REPO, DB_FILE)
-    with open(db_path, 'w') as f: json.dump(db, f, indent=4)
+    with open(db_path, 'w') as f:
+        json.dump(db, f, indent=4)
     try:
+        logger.info("Сохраняю изменения на GitHub...")
         subprocess.run(f'cd {GITHUB_REPO} && git config user.name "Video Assistant Bot" && git config user.email "bot@render.com"', shell=True, check=True)
         subprocess.run(f'cd {GITHUB_REPO} && git add {DB_FILE}', shell=True, check=True)
         result = subprocess.run(f'cd {GITHUB_REPO} && git diff --staged --quiet', shell=True)
         if result.returncode != 0:
             subprocess.run(f'cd {GITHUB_REPO} && git commit -m "Автоматическое обновление базы видео"', shell=True, check=True)
             subprocess.run(f'cd {GITHUB_REPO} && git push', shell=True, check=True)
+            logger.info("Изменения успешно отправлены на GitHub.")
+        else:
+            logger.info("Нет изменений для отправки.")
     except Exception as e:
         logger.error(f"Не удалось отправить изменения на GitHub: {e}")
+
 async def update_status(context: ContextTypes.DEFAULT_TYPE, text: str):
     global current_status_message
     try:
@@ -60,6 +75,7 @@ async def update_status(context: ContextTypes.DEFAULT_TYPE, text: str):
         await context.bot.edit_message_text(text=new_text, chat_id=ADMIN_ID, message_id=context.user_data['status_message_id'])
         current_status_message = new_text
     except Exception: pass
+
 async def process_single_video(video_id: str, title: str, context: ContextTypes.DEFAULT_TYPE):
     global is_processing
     is_processing = True
@@ -103,7 +119,6 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
         is_processing = False
 
 def run_check_job(app):
-    """Функция, которая запускает проверку в отдельном потоке."""
     asyncio.run(check_for_new_videos_async(app))
 
 async def check_for_new_videos_async(app):
@@ -163,41 +178,48 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Не удалось найти информацию об этом видео.")
 
-# --- ЗАПУСК ВСЕЙ СИСТЕМЫ ---
-if __name__ == '__main__':
-    # Сначала клонируем/обновляем репозиторий
-    if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
-    setup_git_repo()
-    
-    # Готовим Telegram-бота
+# --- ЗАПУСК ---
+async def main_bot():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Запускаем бота в фоновом потоке
-    bot_thread = Thread(target=application.run_polling)
-    bot_thread.daemon = True
-    bot_thread.start()
+    logger.info("Бот настроен. Запускаю polling...")
+    await application.initialize()
+    await application.start()
+    await application.run_polling()
 
-    # Готовим Flask-сервер
-    app = Flask(__name__)
+def run_flask(app):
+    # Запускаем Flask в отдельном потоке
+    flask_thread = Thread(target=app.run, kwargs={'host':'0.0.0.0', 'port':int(os.environ.get('PORT', 10000))})
+    flask_thread.daemon = True
+    flask_thread.start()
+
+if __name__ == '__main__':
+    if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
+    setup_git_repo()
     
-    @app.route('/')
+    flask_app = Flask(__name__)
+    @flask_app.route('/')
     def hello_world():
         return 'Бот-ассистент работает!'
 
-    # --- НОВЫЙ СЕКРЕТНЫЙ РОУТ ДЛЯ ЗАПУСКА ПРОВЕРКИ ---
-    @app.route(f'/run-check/{CRON_SECRET_KEY}')
+    @flask_app.route(f'/run-check/{CRON_SECRET_KEY}')
     def trigger_check():
         if is_processing:
             return "Бот уже занят обработкой.", 429
         
-        # Запускаем проверку в фоновом потоке, чтобы не задерживать ответ
-        check_thread = Thread(target=run_check_job, args=[application])
+        # Для запуска асинхронной функции из Flask нам нужна временная асинхронная обертка
+        async def run_check_in_background():
+            temp_app_for_context = Application.builder().token(BOT_TOKEN).build()
+            await check_for_new_videos_async(temp_app_for_context)
+
+        check_thread = Thread(target=asyncio.run, args=(run_check_in_background(),))
         check_thread.daemon = True
         check_thread.start()
         return "Проверка новых видео запущена!", 200
 
-    # Запускаем Flask в основном потоке
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+    run_flask(flask_app)
+    
+    # Основной поток запускает бота
+    asyncio.run(main_bot())
