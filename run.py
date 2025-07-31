@@ -8,10 +8,9 @@ from threading import Thread
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from apscheduler.schedulers.background import BackgroundScheduler
 import asyncio
 
-# --- НАСТРОЙКИ (без изменений) ---
+# --- НАСТРОЙКИ ---
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UCAvrIl6ltV8MdJo3mV4Nl4Q"
 TEMP_FOLDER = 'temp_videos'
 DB_FILE = 'videos.json'
@@ -23,111 +22,91 @@ GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
 GITHUB_REPO = os.environ.get('GITHUB_REPO')
 GITHUB_PAT = os.environ.get('GITHUB_PAT')
 GIT_REPO_URL = f"https://{GITHUB_USERNAME}:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
+# Секретный ключ для запуска проверки. Придумай что-то свое и добавь в Secrets
+CRON_SECRET_KEY = os.environ.get('CRON_SECRET_KEY', 'default_secret_key') 
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 is_processing = False
 current_status_message = ""
 
-# --- ВСЕ ФУНКЦИИ (setup_git_repo, get_video_db, process_single_video и т.д.) остаются БЕЗ ИЗМЕНЕНИЙ ---
-# ... (здесь идет весь код, который был выше, я его не дублирую для краткости) ...
+# ... (ВСЕ ФУНКЦИИ до блока Telegram-бота остаются без изменений) ...
 def setup_git_repo():
     if os.path.exists(GITHUB_REPO):
-        logger.info("Обновляю существующий репозиторий...")
         subprocess.run(f"cd {GITHUB_REPO} && git pull", shell=True, check=True)
     else:
-        logger.info("Клонирую репозиторий со склада...")
         subprocess.run(f"git clone {GIT_REPO_URL}", shell=True, check=True)
-
 def get_video_db():
     db_path = os.path.join(GITHUB_REPO, DB_FILE)
     if os.path.exists(db_path):
         with open(db_path, 'r') as f: return json.load(f)
     return []
-
 def save_and_push_db(db):
     db_path = os.path.join(GITHUB_REPO, DB_FILE)
-    with open(db_path, 'w') as f:
-        json.dump(db, f, indent=4)
+    with open(db_path, 'w') as f: json.dump(db, f, indent=4)
     try:
-        logger.info("Сохраняю изменения на GitHub...")
         subprocess.run(f'cd {GITHUB_REPO} && git config user.name "Video Assistant Bot" && git config user.email "bot@render.com"', shell=True, check=True)
         subprocess.run(f'cd {GITHUB_REPO} && git add {DB_FILE}', shell=True, check=True)
         result = subprocess.run(f'cd {GITHUB_REPO} && git diff --staged --quiet', shell=True)
         if result.returncode != 0:
             subprocess.run(f'cd {GITHUB_REPO} && git commit -m "Автоматическое обновление базы видео"', shell=True, check=True)
             subprocess.run(f'cd {GITHUB_REPO} && git push', shell=True, check=True)
-            logger.info("Изменения успешно отправлены на GitHub.")
-        else:
-            logger.info("Нет изменений для отправки.")
     except Exception as e:
         logger.error(f"Не удалось отправить изменения на GitHub: {e}")
-
 async def update_status(context: ContextTypes.DEFAULT_TYPE, text: str):
     global current_status_message
     try:
         new_text = f"{current_status_message}\n{text}"
         await context.bot.edit_message_text(text=new_text, chat_id=ADMIN_ID, message_id=context.user_data['status_message_id'])
         current_status_message = new_text
-    except Exception:
-        pass
-
+    except Exception: pass
 async def process_single_video(video_id: str, title: str, context: ContextTypes.DEFAULT_TYPE):
     global is_processing
     is_processing = True
-    
     if context: await update_status(context, f"🎬 Начинаю обработку: {title[:50]}...")
-    
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     video_parts_info = []
-
     try:
         if context: await update_status(context, "📥 Скачиваю видео (480p)...")
         temp_filepath_template = os.path.join(TEMP_FOLDER, f'{video_id}_full.%(ext)s')
         command_dl = ['yt-dlp', '-f', 'best[height<=480]', '--output', temp_filepath_template, video_url]
         subprocess.run(command_dl, check=True, timeout=900)
-        
         full_filename = next((f for f in os.listdir(TEMP_FOLDER) if f.startswith(f"{video_id}_full")), None)
         if not full_filename: raise Exception("Файл не скачался")
         full_filepath = os.path.join(TEMP_FOLDER, full_filename)
-
         if context: await update_status(context, "🔪 Начинаю нарезку...")
         chunk_filename_template = os.path.join(TEMP_FOLDER, f"{video_id}_part_%03d.mp4")
         command_ffmpeg = ['ffmpeg', '-i', full_filepath, '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-map', '0', '-segment_time', str(CHUNK_DURATION_SECONDS), '-f', 'segment', '-reset_timestamps', '1', '-movflags', '+faststart', chunk_filename_template]
         subprocess.run(command_ffmpeg, check=True, timeout=1800)
         os.remove(full_filepath)
-
         chunks = sorted([f for f in os.listdir(TEMP_FOLDER) if f.startswith(f"{video_id}_part_")])
         if context: await update_status(context, f"📤 Нарезано {len(chunks)} частей. Загружаю...")
-
         for i, chunk_filename in enumerate(chunks):
             if context: await update_status(context, f"  > Загружаю часть {i+1}/{len(chunks)}...")
             chunk_filepath = os.path.join(TEMP_FOLDER, chunk_filename)
             part_title = f"{title} - Часть {i+1}"
-            
             with open(chunk_filepath, 'rb') as video_file:
                 message = await context.bot.send_video(chat_id=CHANNEL_ID, video=video_file, caption=part_title, read_timeout=300, write_timeout=300, connect_timeout=300)
-            
             video_parts_info.append({'part_num': i + 1, 'file_id': message.video.file_id})
             os.remove(chunk_filepath)
-        
         if context: await update_status(context, "💾 Обновляю базу данных...")
         if video_parts_info:
             new_entry = {'id': video_id, 'title': title, 'parts': video_parts_info}
-            db = get_video_db()
-            db = [v for v in db if v['id'] != video_id]
-            db.insert(0, new_entry)
+            db = get_video_db(); db = [v for v in db if v['id'] != video_id]; db.insert(0, new_entry)
             while len(db) > MAX_VIDEOS_ENTRIES: db.pop()
             save_and_push_db(db)
-        
         if context: await update_status(context, "🎉 Готово! Видео успешно обработано.")
-    
     except Exception as e:
         logger.error(f"Критическая ошибка при обработке '{title}': {e}")
         if context: await update_status(context, f"❌ Ошибка: {e}")
     finally:
         is_processing = False
 
-async def scheduled_job_async(app):
+def run_check_job(app):
+    """Функция, которая запускает проверку в отдельном потоке."""
+    asyncio.run(check_for_new_videos_async(app))
+
+async def check_for_new_videos_async(app):
     global is_processing
     if is_processing:
         logger.info("Проверка по расписанию пропущена: бот уже занят."); return
@@ -144,22 +123,17 @@ async def scheduled_job_async(app):
     context.user_data['status_message_id'] = message.message_id
     await process_single_video(video_to_process['id'], video_to_process['title'], context)
 
-def run_scheduled_job(app):
-    asyncio.run(scheduled_job_async(app))
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     keyboard = [[InlineKeyboardButton("📋 Показать незагруженные видео", callback_data='list_new_videos')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('Привет! Я твой видео-ассистент.', reply_markup=reply_markup)
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     if is_processing:
         await update.message.reply_text(f"Я сейчас занят. Текущий статус:\n{current_status_message}")
     else:
         await update.message.reply_text("Я свободен и готов к работе! ✅")
-
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -189,47 +163,41 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Не удалось найти информацию об этом видео.")
 
-# --- НОВЫЙ, ИСПРАВЛЕННЫЙ ЗАПУСК ---
-async def main():
-    # Создаем необходимые папки и репозиторий
+# --- ЗАПУСК ВСЕЙ СИСТЕМЫ ---
+if __name__ == '__main__':
+    # Сначала клонируем/обновляем репозиторий
     if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
+    setup_git_repo()
     
-    # --- Настройка и запуск Telegram-бота ---
+    # Готовим Telegram-бота
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    # --- Настройка и запуск планировщика ---
-    scheduler = BackgroundScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(run_scheduled_job, 'cron', args=[application], day_of_week='mon,tue,thu', hour=15, minute='0,30')
-    scheduler.add_job(run_scheduled_job, 'cron', args=[application], day_of_week='wed,sat', hour='11-12', minute='0,30')
-    scheduler.start()
-    
-    logger.info("Планировщик и бот настроены. Запускаю polling...")
-    
-    # Запускаем бота в асинхронном режиме
-    await application.initialize()
-    await application.start()
-    await application.run_polling()
+    # Запускаем бота в фоновом потоке
+    bot_thread = Thread(target=application.run_polling)
+    bot_thread.daemon = True
+    bot_thread.start()
 
-# --- Запуск Flask-сервера в отдельном потоке (для Render) ---
-def run_flask():
+    # Готовим Flask-сервер
     app = Flask(__name__)
+    
     @app.route('/')
     def hello_world():
         return 'Бот-ассистент работает!'
-    # Render сам найдет нужный порт, поэтому 10000 может быть лучше
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
-if __name__ == '__main__':
-    # Сначала клонируем/обновляем репозиторий
-    setup_git_repo()
-    
-    # Запускаем Flask в фоновом потоке
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    # Основной поток запускает асинхронного бота
-    asyncio.run(main())
+    # --- НОВЫЙ СЕКРЕТНЫЙ РОУТ ДЛЯ ЗАПУСКА ПРОВЕРКИ ---
+    @app.route(f'/run-check/{CRON_SECRET_KEY}')
+    def trigger_check():
+        if is_processing:
+            return "Бот уже занят обработкой.", 429
+        
+        # Запускаем проверку в фоновом потоке, чтобы не задерживать ответ
+        check_thread = Thread(target=run_check_job, args=[application])
+        check_thread.daemon = True
+        check_thread.start()
+        return "Проверка новых видео запущена!", 200
+
+    # Запускаем Flask в основном потоке
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
