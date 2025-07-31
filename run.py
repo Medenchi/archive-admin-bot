@@ -2,14 +2,11 @@ import os
 import json
 import subprocess
 import feedparser
-import time as time_module
+import time
 import logging
-from threading import Thread
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import time
 
 # --- НАСТРОЙКИ ---
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UCAvrIl6ltV8MdJo3mV4Nl4Q"
@@ -18,7 +15,6 @@ DB_FILE = 'videos.json'
 MAX_VIDEOS_ENTRIES = 25 
 CHUNK_DURATION_SECONDS = 240
 COOKIE_FILE = 'cookies.txt'
-
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('TELEGRAM_ADMIN_ID'))
 GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
@@ -90,7 +86,7 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
             with open(chunk_filepath, 'rb') as video_file:
                 message = await context.bot.send_video(chat_id=CHANNEL_ID, video=video_file, caption=part_title, read_timeout=300, write_timeout=300, connect_timeout=300)
             video_parts_info.append({'part_num': i + 1, 'file_id': message.video.file_id})
-            os.remove(chunk_filename)
+            os.remove(chunk_filepath)
         if context: await update_status(context, "💾 Обновляю базу данных...")
         if video_parts_info:
             new_entry = {'id': video_id, 'title': title, 'parts': video_parts_info}
@@ -103,21 +99,6 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
         if context: await update_status(context, f"❌ Ошибка: {e}")
     finally:
         is_processing = False
-async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
-    global is_processing
-    if is_processing:
-        logger.info("Проверка по расписанию пропущена."); return
-    logger.info("--- Запуск проверки по расписанию ---"); setup_git_repo()
-    db = get_video_db(); existing_ids = {video['id'] for video in db}
-    feed = feedparser.parse(YOUTUBE_CHANNEL_URL)
-    new_videos = [{'id': e.yt_videoid, 'title': e.title} for e in feed.entries if e.yt_videoid not in existing_ids]
-    if not new_videos:
-        logger.info("Новых видео не найдено."); return
-    logger.info(f"Найдено {len(new_videos)} новых видео. Обрабатываю самое старое.")
-    video_to_process = reversed(new_videos).__next__()
-    message = await context.bot.send_message(chat_id=ADMIN_ID, text="Начинаю автоматическую обработку...")
-    context.user_data['status_message_id'] = message.message_id
-    await process_single_video(video_to_process['id'], video_to_process['title'], context)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     keyboard = [[InlineKeyboardButton("📋 Показать незагруженные видео", callback_data='list_new_videos')]]
@@ -170,29 +151,12 @@ def main():
     
     try:
         application = Application.builder().token(BOT_TOKEN).build()
-        job_queue = application.job_queue
-        # ... (настройка job_queue без изменений)
-        job_queue.run_daily(scheduled_job, time=time(12, 0), days=(0, 1, 3))
-        job_queue.run_daily(scheduled_job, time=time(12, 30), days=(0, 1, 3))
-        job_queue.run_daily(scheduled_job, time=time(8, 0), days=(2, 5))
-        job_queue.run_daily(scheduled_job, time=time(8, 30), days=(2, 5))
-        job_queue.run_daily(scheduled_job, time=time(9, 0), days=(2, 5))
-        
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("status", status))
         application.add_handler(CallbackQueryHandler(button_callback))
         
         logger.info("Бот готов и запускается...")
-        
-        # --- ФИНАЛЬНОЕ ИСПРАВЛЕНИЕ ---
-        # Правильный способ запустить polling в асинхронном окружении
-        async def run_bot():
-            await application.initialize()
-            await application.start()
-            await application.run_polling()
-        
-        asyncio.run(run_bot())
-
+        application.run_polling()
     finally:
         if os.path.exists(COOKIE_FILE):
             os.remove(COOKIE_FILE)
