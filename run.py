@@ -4,14 +4,15 @@ import subprocess
 import feedparser
 import time
 import logging
+from threading import Thread
 import asyncio
-import requests
+from flask import Flask # <-- Добавляем Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import time
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ (без изменений) ---
 YOUTUBE_CHANNEL_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UCAvrIl6ltV8MdJo3mV4Nl4Q"
 TEMP_FOLDER = 'temp_videos'
 DB_FILE = 'videos.json'
@@ -22,36 +23,29 @@ ADMIN_ID = int(os.environ.get('TELEGRAM_ADMIN_ID'))
 GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
 GITHUB_REPO = os.environ.get('GITHUB_REPO')
 GITHUB_PAT = os.environ.get('GITHUB_PAT')
+YOUTUBE_COOKIES_DATA = os.environ.get('YOUTUBE_COOKIES')
 GIT_REPO_URL = f"https://{GITHUB_USERNAME}:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
+COOKIE_FILE = 'cookies.txt'
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 is_processing = False
 current_status_message = ""
 
-# =================================================================================
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-# =================================================================================
-
+# ... (ВСЕ функции до блока ЗАПУСК остаются без изменений) ...
 def setup_git_repo():
     if os.path.exists(GITHUB_REPO):
         subprocess.run(f"cd {GITHUB_REPO} && git pull", shell=True, check=True)
     else:
         subprocess.run(f"git clone {GIT_REPO_URL}", shell=True, check=True)
-
 def get_video_db():
     db_path = os.path.join(GITHUB_REPO, DB_FILE)
     if os.path.exists(db_path):
-        try:
-            with open(db_path, 'r') as f: return json.load(f)
-        except json.JSONDecodeError:
-            return []
+        with open(db_path, 'r') as f: return json.load(f)
     return []
-
 def save_and_push_db(db):
     db_path = os.path.join(GITHUB_REPO, DB_FILE)
-    with open(db_path, 'w') as f:
-        json.dump(db, f, indent=4)
+    with open(db_path, 'w') as f: json.dump(db, f, indent=4)
     try:
         subprocess.run(f'cd {GITHUB_REPO} && git config user.name "Video Assistant Bot" && git config user.email "bot@render.com"', shell=True, check=True)
         subprocess.run(f'cd {GITHUB_REPO} && git add {DB_FILE}', shell=True, check=True)
@@ -59,44 +53,15 @@ def save_and_push_db(db):
         if result.returncode != 0:
             subprocess.run(f'cd {GITHUB_REPO} && git commit -m "Автоматическое обновление базы видео"', shell=True, check=True)
             subprocess.run(f'cd {GITHUB_REPO} && git push', shell=True, check=True)
-            logger.info("Изменения успешно отправлены на GitHub.")
-        else:
-            logger.info("Нет изменений для отправки.")
     except Exception as e:
         logger.error(f"Не удалось отправить изменения на GitHub: {e}")
-
 async def update_status(context: ContextTypes.DEFAULT_TYPE, text: str):
     global current_status_message
     try:
         new_text = f"{current_status_message}\n{text}"
         await context.bot.edit_message_text(text=new_text, chat_id=ADMIN_ID, message_id=context.user_data['status_message_id'])
         current_status_message = new_text
-    except Exception:
-        pass
-
-def get_free_proxy():
-    """Пытается найти рабочий бесплатный прокси."""
-    logger.info("Ищу бесплатный прокси...")
-    try:
-        response = requests.get("https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&sort_by=lastChecked&sort_type=desc&protocols=http", timeout=20)
-        response.raise_for_status()
-        proxies = response.json().get('data', [])
-        for proxy in proxies:
-            proxy_url = f"http://{proxy['ip']}:{proxy['port']}"
-            logger.info(f"Проверяю прокси: {proxy_url}")
-            try:
-                test_response = requests.get("https://www.google.com", proxies={"http": proxy_url, "https": proxy_url}, timeout=10)
-                if test_response.status_code == 200:
-                    logger.info(f"✅ Найден рабочий прокси: {proxy_url}")
-                    return proxy_url
-            except Exception:
-                logger.warning(f"Прокси {proxy_url} не работает. Ищу следующий.")
-                continue
-    except Exception as e:
-        logger.error(f"Не удалось получить список прокси: {e}")
-    logger.error("Рабочий прокси не найден.")
-    return None
-
+    except Exception: pass
 async def process_single_video(video_id: str, title: str, context: ContextTypes.DEFAULT_TYPE):
     global is_processing
     is_processing = True
@@ -104,16 +69,10 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     video_parts_info = []
     try:
-        proxy = get_free_proxy()
-        if not proxy:
-            raise Exception("Не удалось найти рабочий прокси для скачивания.")
-            
-        if context: await update_status(context, f"📥 Скачиваю видео (480p) через прокси...")
+        if context: await update_status(context, "📥 Скачиваю видео (480p)...")
         temp_filepath_template = os.path.join(TEMP_FOLDER, f'{video_id}_full.%(ext)s')
-        
-        command_dl = ['yt-dlp', '--proxy', proxy, '-f', 'best[height<=480]', '--output', temp_filepath_template, video_url]
+        command_dl = ['yt-dlp', '--cookies', COOKIE_FILE, '-f', 'best[height<=480]', '--output', temp_filepath_template, video_url]
         subprocess.run(command_dl, check=True, timeout=900)
-        
         full_filename = next((f for f in os.listdir(TEMP_FOLDER) if f.startswith(f"{video_id}_full")), None)
         if not full_filename: raise Exception("Файл не скачался")
         full_filepath = os.path.join(TEMP_FOLDER, full_filename)
@@ -144,7 +103,6 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
         if context: await update_status(context, f"❌ Ошибка: {e}")
     finally:
         is_processing = False
-
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     global is_processing
     if is_processing:
@@ -160,20 +118,17 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     message = await context.bot.send_message(chat_id=ADMIN_ID, text="Начинаю автоматическую обработку...")
     context.user_data['status_message_id'] = message.message_id
     await process_single_video(video_to_process['id'], video_to_process['title'], context)
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     keyboard = [[InlineKeyboardButton("📋 Показать незагруженные видео", callback_data='list_new_videos')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('Привет! Я твой видео-ассистент.', reply_markup=reply_markup)
-
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     if is_processing:
         await update.message.reply_text(f"Я сейчас занят. Текущий статус:\n{current_status_message}")
     else:
         await update.message.reply_text("Я свободен и готов к работе! ✅")
-
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -202,12 +157,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Не удалось найти информацию об этом видео.")
 
-def main():
-    if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
-    setup_git_repo()
-    
+# --- НОВЫЙ, ИСПРАВЛЕННЫЙ БЛОК ЗАПУСКА ---
+
+def run_bot():
+    """Эта функция запускает бота в отдельном потоке."""
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Настройка расписания
     job_queue = application.job_queue
     job_queue.run_daily(scheduled_job, time=time(12, 0), days=(0, 1, 3))
     job_queue.run_daily(scheduled_job, time=time(12, 30), days=(0, 1, 3))
@@ -215,12 +171,33 @@ def main():
     job_queue.run_daily(scheduled_job, time=time(8, 30), days=(2, 5))
     job_queue.run_daily(scheduled_job, time=time(9, 0), days=(2, 5))
     
+    # Настройка команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CallbackQueryHandler(button_callback))
     
-    logger.info("Бот готов и запускается...")
+    logger.info("Бот готов и запускается в фоновом потоке...")
     application.run_polling()
 
 if __name__ == '__main__':
-    main()
+    # Подготовка
+    if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
+    setup_git_repo()
+    
+    if YOUTUBE_COOKIES_DATA:
+        with open(COOKIE_FILE, 'w') as f:
+            f.write(YOUTUBE_COOKIES_DATA)
+        logger.info("Временный файл cookies.txt создан.")
+    
+    # Запускаем бота в фоновом потоке
+    bot_thread = Thread(target=run_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+    
+    # Основной поток запускает Flask-сервер для Render
+    app = Flask(__name__)
+    @app.route('/')
+    def hello_world():
+        return 'Бот-ассистент работает в фоновом режиме!'
+        
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
