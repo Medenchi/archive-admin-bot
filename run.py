@@ -6,18 +6,18 @@ import time
 import logging
 from threading import Thread
 import asyncio
-from flask import Flask # <-- Добавляем Flask
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import time
 
 # --- НАСТРОЙКИ (без изменений) ---
-YOUTUBE_CHANNEL_URL = "https://www.youtube.com/feeds/videos.xml?channel_id=UCAvrIl6ltV8MdJo3mV4Nl4Q"
+YOUTUBE_CHANNEL_URL = "https://www.youtube.com/feeds/videos/xml?channel_id=UCAvrIl6ltV8MdJo3mV4Nl4Q"
 TEMP_FOLDER = 'temp_videos'
 DB_FILE = 'videos.json'
 MAX_VIDEOS_ENTRIES = 25 
 CHUNK_DURATION_SECONDS = 240
+COOKIE_FILE = 'cookies.txt'
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('TELEGRAM_ADMIN_ID'))
 GITHUB_USERNAME = os.environ.get('GITHUB_USERNAME')
@@ -25,7 +25,6 @@ GITHUB_REPO = os.environ.get('GITHUB_REPO')
 GITHUB_PAT = os.environ.get('GITHUB_PAT')
 YOUTUBE_COOKIES_DATA = os.environ.get('YOUTUBE_COOKIES')
 GIT_REPO_URL = f"https://{GITHUB_USERNAME}:{GITHUB_PAT}@github.com/{GITHUB_USERNAME}/{GITHUB_REPO}.git"
-COOKIE_FILE = 'cookies.txt'
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -103,21 +102,6 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
         if context: await update_status(context, f"❌ Ошибка: {e}")
     finally:
         is_processing = False
-async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
-    global is_processing
-    if is_processing:
-        logger.info("Проверка по расписанию пропущена."); return
-    logger.info("--- Запуск проверки по расписанию ---"); setup_git_repo()
-    db = get_video_db(); existing_ids = {video['id'] for video in db}
-    feed = feedparser.parse(YOUTUBE_CHANNEL_URL)
-    new_videos = [{'id': e.yt_videoid, 'title': e.title} for e in feed.entries if e.yt_videoid not in existing_ids]
-    if not new_videos:
-        logger.info("Новых видео не найдено."); return
-    logger.info(f"Найдено {len(new_videos)} новых видео. Обрабатываю самое старое.")
-    video_to_process = reversed(new_videos).__next__()
-    message = await context.bot.send_message(chat_id=ADMIN_ID, text="Начинаю автоматическую обработку...")
-    context.user_data['status_message_id'] = message.message_id
-    await process_single_video(video_to_process['id'], video_to_process['title'], context)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     keyboard = [[InlineKeyboardButton("📋 Показать незагруженные видео", callback_data='list_new_videos')]]
@@ -157,19 +141,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text("Не удалось найти информацию об этом видео.")
 
-# --- НОВЫЙ, ИСПРАВЛЕННЫЙ БЛОК ЗАПУСКА ---
+# --- НОВЫЙ, САМЫЙ НАДЕЖНЫЙ БЛОК ЗАПУСКА ---
+# Глобальная переменная для хранения потока с ботом
+bot_thread = None
 
-def run_bot():
-    """Эта функция запускает бота в отдельном потоке."""
-    application = Application.builder().token(BOT_TOKEN).build()
+def run_bot_async():
+    """Функция, которая будет запускать бота в отдельном потоке."""
+    # Создаем новый асинхронный цикл специально для этого потока
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
-    # Настройка расписания
-    job_queue = application.job_queue
-    job_queue.run_daily(scheduled_job, time=time(12, 0), days=(0, 1, 3))
-    job_queue.run_daily(scheduled_job, time=time(12, 30), days=(0, 1, 3))
-    job_queue.run_daily(scheduled_job, time=time(8, 0), days=(2, 5))
-    job_queue.run_daily(scheduled_job, time=time(8, 30), days=(2, 5))
-    job_queue.run_daily(scheduled_job, time=time(9, 0), days=(2, 5))
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Настройка команд
     application.add_handler(CommandHandler("start", start))
@@ -189,15 +171,21 @@ if __name__ == '__main__':
             f.write(YOUTUBE_COOKIES_DATA)
         logger.info("Временный файл cookies.txt создан.")
     
-    # Запускаем бота в фоновом потоке
-    bot_thread = Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-    
-    # Основной поток запускает Flask-сервер для Render
+    # Запускаем Flask в основном потоке
     app = Flask(__name__)
+    
     @app.route('/')
     def hello_world():
-        return 'Бот-ассистент работает в фоновом режиме!'
+        global bot_thread
+        # --- ЛОГИКА "ленивого" ЗАПУСКА БОТА ---
+        # Бот запускается только один раз, при первом визите (от UptimeRobot)
+        if bot_thread is None or not bot_thread.is_alive():
+            logger.info("Бот не запущен или упал. Запускаю заново...")
+            bot_thread = Thread(target=run_bot_async)
+            bot_thread.daemon = True
+            bot_thread.start()
+            return 'Бот запущен!'
+        
+        return 'Бот уже работает!'
         
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
