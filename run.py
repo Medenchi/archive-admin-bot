@@ -50,7 +50,8 @@ def get_video_db():
 
 def save_and_push_db(db):
     db_path = os.path.join(GITHUB_REPO, DB_FILE)
-    with open(db_path, 'w') as f: json.dump(db, f, indent=4)
+    with open(db_path, 'w') as f:
+        json.dump(db, f, indent=4)
     try:
         subprocess.run(f'cd {GITHUB_REPO} && git config user.name "Video Assistant Bot" && git config user.email "bot@render.com"', shell=True, check=True)
         subprocess.run(f'cd {GITHUB_REPO} && git add {DB_FILE}', shell=True, check=True)
@@ -70,13 +71,15 @@ async def update_status(context: ContextTypes.DEFAULT_TYPE, text: str):
         new_text = f"{current_status_message}\n{text}"
         await context.bot.edit_message_text(text=new_text, chat_id=ADMIN_ID, message_id=context.user_data['status_message_id'])
         current_status_message = new_text
-    except Exception: pass
+    except Exception:
+        pass
 
 def get_free_proxy():
     """Пытается найти рабочий бесплатный прокси."""
     logger.info("Ищу бесплатный прокси...")
     try:
         response = requests.get("https://proxylist.geonode.com/api/proxy-list?limit=50&page=1&sort_by=lastChecked&sort_type=desc&protocols=http", timeout=20)
+        response.raise_for_status()
         proxies = response.json().get('data', [])
         for proxy in proxies:
             proxy_url = f"http://{proxy['ip']}:{proxy['port']}"
@@ -87,7 +90,7 @@ def get_free_proxy():
                     logger.info(f"✅ Найден рабочий прокси: {proxy_url}")
                     return proxy_url
             except Exception:
-                logger.warning(f"Прокси {proxy_url} не отвечает. Ищу следующий.")
+                logger.warning(f"Прокси {proxy_url} не работает. Ищу следующий.")
                 continue
     except Exception as e:
         logger.error(f"Не удалось получить список прокси: {e}")
@@ -100,7 +103,6 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
     if context: await update_status(context, f"🎬 Начинаю обработку: {title[:50]}...")
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     video_parts_info = []
-
     try:
         proxy = get_free_proxy()
         if not proxy:
@@ -115,16 +117,13 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
         full_filename = next((f for f in os.listdir(TEMP_FOLDER) if f.startswith(f"{video_id}_full")), None)
         if not full_filename: raise Exception("Файл не скачался")
         full_filepath = os.path.join(TEMP_FOLDER, full_filename)
-        
         if context: await update_status(context, "🔪 Начинаю нарезку...")
         chunk_filename_template = os.path.join(TEMP_FOLDER, f"{video_id}_part_%03d.mp4")
         command_ffmpeg = ['ffmpeg', '-i', full_filepath, '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-map', '0', '-segment_time', str(CHUNK_DURATION_SECONDS), '-f', 'segment', '-reset_timestamps', '1', '-movflags', '+faststart', chunk_filename_template]
         subprocess.run(command_ffmpeg, check=True, timeout=1800)
         os.remove(full_filepath)
-        
         chunks = sorted([f for f in os.listdir(TEMP_FOLDER) if f.startswith(f"{video_id}_part_")])
         if context: await update_status(context, f"📤 Нарезано {len(chunks)} частей. Загружаю...")
-        
         for i, chunk_filename in enumerate(chunks):
             if context: await update_status(context, f"  > Загружаю часть {i+1}/{len(chunks)}...")
             chunk_filepath = os.path.join(TEMP_FOLDER, chunk_filename)
@@ -132,8 +131,7 @@ async def process_single_video(video_id: str, title: str, context: ContextTypes.
             with open(chunk_filepath, 'rb') as video_file:
                 message = await context.bot.send_video(chat_id=CHANNEL_ID, video=video_file, caption=part_title, read_timeout=300, write_timeout=300, connect_timeout=300)
             video_parts_info.append({'part_num': i + 1, 'file_id': message.video.file_id})
-            os.remove(chunk_filepath)
-        
+            os.remove(chunk_filename)
         if context: await update_status(context, "💾 Обновляю базу данных...")
         if video_parts_info:
             new_entry = {'id': video_id, 'title': title, 'parts': video_parts_info}
@@ -168,12 +166,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("📋 Показать незагруженные видео", callback_data='list_new_videos')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('Привет! Я твой видео-ассистент.', reply_markup=reply_markup)
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     if is_processing:
         await update.message.reply_text(f"Я сейчас занят. Текущий статус:\n{current_status_message}")
     else:
         await update.message.reply_text("Я свободен и готов к работе! ✅")
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -220,14 +220,7 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
     
     logger.info("Бот готов и запускается...")
-    
-    # Правильный способ запустить polling в асинхронном окружении
-    async def run_bot():
-        await application.initialize()
-        await application.start()
-        await application.run_polling()
-    
-    asyncio.run(run_bot())
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
