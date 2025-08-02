@@ -2,3 +2,4 @@ feedparser
 python-telegram-bot[ext]
 yt-dlp
 requests
+flask
